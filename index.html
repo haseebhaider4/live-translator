@@ -67,6 +67,13 @@
   }
   #gate p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; max-width: 340px; }
   #gate b { color: var(--text); }
+  #gate .link { color: var(--accent); text-decoration: underline; font-size: 15px; background: none; border: 0; padding: 8px; cursor: pointer; }
+  #settings { display: none; flex-direction: column; gap: 10px; padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line); }
+  #settings.show { display: flex; }
+  #settings label { flex-wrap: wrap; font-size: 14px; }
+  #settings input[type=password], #settings select { flex: 1; min-width: 200px; font: inherit; font-size: 15px; color: var(--text); background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 9px 10px; }
+  #settings p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.45; }
+  #banner small { display: block; opacity: .75; margin-top: 4px; }
   button, input { touch-action: manipulation; }
 
   /* phone */
@@ -96,8 +103,20 @@
     <label><input id="showDe" type="checkbox" checked> German</label>
     <button class="small" id="save">Save transcript</button>
     <button class="small" id="clear">Clear</button>
+    <button class="small" id="settingsBtn">Settings</button>
   </div>
 </header>
+<div id="settings">
+  <label>Speech engine
+    <select id="engineSel">
+      <option value="auto">Auto — Whisper if a Groq key is set</option>
+      <option value="browser">Built-in (Safari / Chrome speech)</option>
+      <option value="whisper">Whisper via Groq — any language, most reliable on iPhone</option>
+    </select>
+  </label>
+  <label>Groq API key <input id="groqKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false"></label>
+  <p>Whisper records the audio itself and sends short clips to Groq, so it works even when the iPhone refuses the built-in speech recognition, and it understands any language. Free key at console.groq.com → API Keys. The key is stored only on this device.</p>
+</div>
 <div id="banner"></div>
 <main id="feed">
   <div id="empty">Put your headphones in, press <b>Start</b> and allow the microphone.<br>German around you is shown and spoken in English until you press <b>Stop</b>.<br>Keep the screen on — the phone stops listening when it locks.</div>
@@ -107,6 +126,7 @@
   <div class="big">Tap to start</div>
   <p><b>Tap anywhere.</b> If asked, allow the <b>microphone</b> and <b>speech recognition</b> — that's all.</p>
   <p id="gateNote"></p>
+  <button class="link" id="gateSettings">Settings</button>
 </div>
 
 <script>
@@ -177,21 +197,21 @@ async function initTranslatorInner() {
   setFoot();
 }
 
-async function translate(text) {
+async function translate(text, sl = 'de') {
   if (!text.trim()) return '';
-  if (translator) {
+  if (translator && sl === 'de') {
     const t = translator;
     try { return await withTimeout(t.translate(text), TRANSLATE_TIMEOUT_MS); }
     catch (e) { if (t === translator) resetTranslator(e.message === 'timeout' ? 'no response' : 'error'); }
   }
   const q = encodeURIComponent(text);
   try {
-    const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${src()}&tl=en&dt=t&q=${q}`, { signal: AbortSignal.timeout(6000) });
+    const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${sl}&tl=en&dt=t&q=${q}`, { signal: AbortSignal.timeout(6000) });
     if (!r.ok) throw new Error(r.status);
     const j = await r.json();
     return j[0].map(x => x[0]).join('');
   } catch (e) {
-    const r = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=${src()}|en`, { signal: AbortSignal.timeout(6000) });
+    const r = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=${sl === 'auto' ? 'de' : sl}|en`, { signal: AbortSignal.timeout(6000) });
     const j = await r.json();
     return j.responseData.translatedText;
   }
@@ -300,6 +320,152 @@ function speechWatchdog() {
   if (speakingNow && Date.now() - speakStartedAt > 15000) { speakingNow = null; synth.cancel(); pump(); }   // stuck voice
 }
 
+/* ---------- choosing the speech engine ---------- */
+let engineMode = 'browser', builtInRefused = false;
+const groqKey = () => $('groqKey').value.trim();
+function pickEngine() {
+  const pref = $('engineSel').value;
+  if (pref === 'whisper') return 'whisper';
+  if (pref === 'browser') return SR ? 'browser' : 'whisper';
+  return (groqKey() || builtInRefused || !SR) ? 'whisper' : 'browser';
+}
+
+/* ---------- Whisper engine (Groq) ----------
+   Records the microphone itself, cuts the audio at natural pauses and sends each clip to
+   Groq's Whisper. Works in Safari, home-screen apps and Chrome, and understands any language. */
+const W = { ctx: null, stream: null, node: null, frames: [], pre: [], speaking: false, silenceMs: 0, speechMs: 0, noise: 0.004, chain: Promise.resolve(), live: null };
+let W_SIL_END_MS = 650, W_MAX_MS = 12000, W_MIN_SPEECH_MS = 300, W_PREROLL = 4;
+const HALLUCINATIONS = /untertitel|amara\.org|copyright|thanks for watching|vielen dank fürs zuschauen|abonnier/i;
+
+async function startWhisper() {
+  if (!groqKey()) {
+    stop();
+    showGate('Whisper needs a Groq key. Open Settings below and paste it, then tap to start.');
+    throw Object.assign(new Error('no key'), { handled: true });
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = W.ctx = new AC();             // created inside the tap, so the iPhone lets it run
+  ctx.resume();
+  setStatus('wait', 'Opening microphone…');
+  const stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  if (!running || W.ctx !== ctx) { stream.getTracks().forEach(t => t.stop()); return; }
+  W.stream = stream;
+  const srcNode = ctx.createMediaStreamSource(stream);
+  const node = W.node = ctx.createScriptProcessor(4096, 1, 1);
+  const mute = ctx.createGain(); mute.gain.value = 0;
+  node.onaudioprocess = e => whisperFrame(new Float32Array(e.inputBuffer.getChannelData(0)), ctx.sampleRate);
+  srcNode.connect(node); node.connect(mute); mute.connect(ctx.destination);
+  W.frames = []; W.pre = []; W.speaking = false;
+  everStarted = true; banner(''); setStatus('live', 'Listening…');
+}
+
+function stopWhisper() {
+  if (W.speaking && W.frames.length) whisperSend(W.frames, W.speechMs, W.ctx?.sampleRate || 48000);
+  W.speaking = false; W.frames = []; W.pre = [];
+  try { W.node && (W.node.onaudioprocess = null, W.node.disconnect()); } catch {}
+  W.stream?.getTracks().forEach(t => t.stop());
+  try { W.ctx?.close(); } catch {}
+  W.ctx = W.stream = W.node = null;
+}
+
+function whisperFrame(d, rate) {
+  if (!running) return;
+  let sum = 0; for (let i = 0; i < d.length; i++) sum += d[i] * d[i];
+  const rms = Math.sqrt(sum / d.length), ms = d.length / rate * 1000;
+  // Background level follows quiet sounds quickly and loud ones slowly.
+  W.noise += (rms - W.noise) * (rms < W.noise ? 0.2 : 0.01);
+  const loud = rms > Math.max(0.008, W.noise * 2.2);
+  const f = { d, rms };
+  if (!W.speaking) {
+    W.pre.push(f); if (W.pre.length > W_PREROLL) W.pre.shift();
+    if (loud) {
+      W.speaking = true; W.frames = W.pre.splice(0); W.speechMs = ms; W.silenceMs = 0;
+      if (!W.live) { W.live = makeEntry('live'); W.live.querySelector('.en').textContent = '…'; append(W.live); }
+    }
+    return;
+  }
+  W.frames.push(f);
+  if (loud) { W.speechMs += ms; W.silenceMs = 0; } else W.silenceMs += ms;
+  if (W.silenceMs >= W_SIL_END_MS) {
+    whisperSend(W.frames, W.speechMs, rate);
+    W.speaking = false; W.frames = []; W.pre = [];
+  } else if (W.frames.length * ms >= W_MAX_MS) {
+    // Long speech without a pause: cut at the quietest moment of the last two seconds.
+    const look = Math.max(1, Math.round(2000 / ms));
+    let cut = W.frames.length - look, best = Infinity;
+    for (let i = W.frames.length - look; i < W.frames.length; i++) if (W.frames[i].rms < best) { best = W.frames[i].rms; cut = i; }
+    whisperSend(W.frames.slice(0, cut + 1), W.speechMs, rate);
+    W.frames = W.frames.slice(cut + 1); W.speechMs = W.frames.length * ms;
+  }
+}
+
+function whisperSend(frames, speechMs, rate) {
+  const el = W.live; W.live = null;
+  if (speechMs < W_MIN_SPEECH_MS) { el?.remove(); return; }
+  const entry = el || makeEntry('');
+  if (!el) append(entry);
+  entry.className = 'entry pending';
+  const wav = toWav(frames.map(f => f.d), rate);
+  const job = transcribe(wav).then(async text => {
+    text = (text || '').trim();
+    if (!text || HALLUCINATIONS.test(text)) { entry.remove(); return ''; }
+    entry.querySelector('.de').textContent = text;
+    const item = { time: new Date(), de: text, en: '' };
+    transcript.push(item);
+    const en = await translate(text, 'auto');
+    item.en = en;
+    entry.querySelector('.en').textContent = en;
+    entry.className = 'entry';
+    setFoot();
+    if (nearBottom()) feed.scrollTop = feed.scrollHeight;
+    return en;
+  }).catch(err => {
+    entry.querySelector('.en').textContent = err.message === 'bad key' ? '(Groq key rejected — check Settings)' : '(could not reach Groq — check internet)';
+    entry.className = 'entry';
+    return '';
+  });
+  W.chain = W.chain.then(() => job).then(en => speak(en));   // speak in the order people talked
+}
+
+async function transcribe(wav, retry = true) {
+  const fd = new FormData();
+  fd.append('file', wav, 'speech.wav');
+  fd.append('model', 'whisper-large-v3-turbo');
+  fd.append('response_format', 'json');
+  fd.append('temperature', '0');
+  const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+    method: 'POST', headers: { Authorization: 'Bearer ' + groqKey() }, body: fd, signal: AbortSignal.timeout(20000)
+  });
+  if (r.status === 401 || r.status === 403) { note('Groq key rejected'); throw new Error('bad key'); }
+  if (r.status === 429 && retry) {
+    note('Groq rate limit — waiting');
+    await new Promise(res => setTimeout(res, Math.min(20, +r.headers.get('retry-after') || 3) * 1000));
+    return transcribe(wav, false);
+  }
+  if (!r.ok) { note('Groq error ' + r.status); throw new Error('groq ' + r.status); }
+  return (await r.json()).text;
+}
+
+// 16 kHz mono 16-bit WAV — small, and exactly what Whisper wants.
+function toWav(chunks, inRate) {
+  const len = chunks.reduce((a, c) => a + c.length, 0), all = new Float32Array(len);
+  let o = 0; for (const c of chunks) { all.set(c, o); o += c.length; }
+  const outRate = Math.min(16000, inRate), ratio = inRate / outRate, n = Math.floor(len / ratio);
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (p, s) => { for (let i = 0; i < s.length; i++) v.setUint8(p + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE'); w(12, 'fmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, outRate, true); v.setUint32(28, outRate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) {
+    const a = Math.floor(i * ratio), b = Math.max(a + 1, Math.floor((i + 1) * ratio));
+    let s = 0; for (let j = a; j < b && j < len; j++) s += all[j];
+    s = Math.max(-1, Math.min(1, s / (b - a)));
+    v.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
 /* ---------- always-on listening ---------- */
 // Speech that the recogniser repeats after we already showed it (on a pause) is cut off here.
 const norm = t => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -316,10 +482,17 @@ function stripConsumed(s, text) {
 function setStatus(kind, text) { dot.className = kind; statusText.textContent = text; }
 function setFoot(msg) {
   $('foot').textContent = msg || (engine
-    ? `Translation: ${engine === 'on-device' ? 'on-device (private, works offline)' : 'online service'} · Lines: ${transcript.length} · Auto-reconnects: ${restarts}${lastIssue ? ' · Last issue: ' + lastIssue : ''}`
+    ? `Speech: ${engineMode === 'whisper' ? 'Whisper (Groq)' : 'built-in'} · Translation: ${engine === 'on-device' ? 'on-device' : 'online'} · Lines: ${transcript.length} · Reconnects: ${restarts}${lastIssue ? ' · Last issue: ' + lastIssue : ''}`
     : 'Ready.');
 }
-function banner(msg) { $('banner').style.display = msg ? 'block' : 'none'; $('banner').textContent = msg || ''; }
+function banner(msg, detail) {
+  const b = $('banner');
+  b.style.display = msg ? 'block' : 'none';
+  b.textContent = msg || '';
+  if (msg && detail) { const s = document.createElement('small'); s.textContent = detail; b.appendChild(s); }
+}
+const IS_STANDALONE = navigator.standalone === true || matchMedia('(display-mode: standalone)').matches;
+const diag = code => `Error code: ${code} · ${IS_IOS ? 'iPhone' : 'computer'} · ${IS_STANDALONE ? 'home-screen app' : 'browser tab'}`;
 function note(issue) { lastIssue = `${issue} at ${new Date().toLocaleTimeString()}`; setFoot(); }
 
 // Exactly one session exists at a time. Events from any older recognizer are ignored,
@@ -365,10 +538,17 @@ function startSession() {
     if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
       if (!everStarted) {
         stop();
-        setStatus('err', 'Microphone blocked');
-        banner(IS_IOS
-          ? 'Microphone or speech recognition is blocked. On iPhone: Settings → Apps → Safari → Microphone → Allow, and Settings → General → Keyboard → turn on Enable Dictation. Then reload this page and tap Start.'
-          : 'Microphone access was blocked. Click the icon at the left of the address bar, allow the microphone, then press Start.');
+        setStatus('err', 'Built-in speech refused');
+        builtInRefused = true;
+        const why = e.error === 'service-not-allowed'
+          ? (IS_STANDALONE ? 'The iPhone does not allow built-in speech recognition in home-screen apps.' : 'The phone refused its built-in speech recognition service.')
+          : 'Built-in speech recognition was not allowed.';
+        if (groqKey()) {
+          showGate(why + ' Tap to continue with Whisper instead.');
+        } else {
+          showGate(why + ' Open Settings below and paste a free Groq key — Whisper works on every iPhone.');
+        }
+        banner(why, diag(e.error));
       } else if (++blockedFails >= 3) {
         stop();
         banner('The phone paused listening (screen locked or app switched). Tap Start to continue.');
@@ -407,15 +587,28 @@ async function start() {
   toggle.textContent = 'Stop'; toggle.classList.add('on');
   setStatus('wait', 'Starting…');
   banner('');
-  unlockSpeech();             // must happen inside the tap on iPhone
+  engineMode = pickEngine();
+  setFoot();
+  // Both must begin inside the tap on iPhone: open the microphone first, then unlock the voice.
+  const mic = engineMode === 'whisper' ? startWhisper() : (startSession(), null);
+  unlockSpeech();
   initTranslator();           // runs alongside; online translation covers the gap
-  startSession();
+  if (mic) mic.catch(err => {
+    if (err.handled) return;
+    stop();
+    setStatus('err', 'Microphone blocked');
+    showGate(IS_IOS
+      ? 'The microphone is blocked for this site. Tap "aA" in the address bar → Website Settings → Microphone → Allow, then reload.'
+      : 'The microphone is blocked. Click the icon left of the address bar → allow Microphone, then reload.');
+    banner('Could not open the microphone.', diag(err.name || err.message));
+  });
   try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
 }
 
 function stop() {
   running = false;
   dropSession();
+  stopWhisper();
   stopSpeaking();
   toggle.textContent = 'Start'; toggle.classList.remove('on');
   setStatus('', 'Stopped');
@@ -428,7 +621,9 @@ setInterval(() => {
   if (!running) return;
   speechWatchdog();
   const now = Date.now(), s = session;
-  if (!s) {
+  if (engineMode === 'whisper') {
+    if (W.ctx && W.ctx.state !== 'running' && document.visibilityState === 'visible') W.ctx.resume().catch(() => {});
+  } else if (!s) {
     if (now - lastDropAt >= RESTART_GAP_MS) startSession();
   } else if (!s.started) {
     if (now - s.createdAt > START_TIMEOUT_MS) dropSession('start timed out');
@@ -437,7 +632,7 @@ setInterval(() => {
   } else if (!liveText.trim() && now - s.createdAt > MAX_AGE_MS) {
     dropSession('');            // routine refresh during a pause, so a session never goes stale
   }
-  if (session?.started && dot.className === 'live') {
+  if ((engineMode === 'whisper' ? W.ctx?.state === 'running' : session?.started) && dot.className === 'live') {
     const sec = Math.floor((now - startedAt) / 1000);
     statusText.textContent = 'Listening… ' + [Math.floor(sec / 3600), Math.floor(sec / 60) % 60, sec % 60].map(n => String(n).padStart(2, '0')).join(':');
   }
@@ -494,7 +689,13 @@ if (!SR) banner(noSRMessage());
 // in one touch. On a laptop with the microphone already allowed, it starts by itself.
 const gate = $('gate');
 function showGate(note) { $('gateNote').textContent = note || ''; gate.classList.add('show'); }
-gate.onclick = () => { gate.classList.remove('show'); if (!running) start(); };
+gate.onclick = () => { gate.classList.remove('show'); if (!running) start(); else W.ctx?.resume(); };
+$('gateSettings').onclick = e => { e.stopPropagation(); gate.classList.remove('show'); $('settings').classList.add('show'); $('groqKey').focus(); };
+$('settingsBtn').onclick = () => $('settings').classList.toggle('show');
+$('groqKey').value = load('groqKey') || '';
+$('engineSel').value = load('engine') || 'auto';
+$('groqKey').onchange = e => save('groqKey', e.target.value.trim());
+$('engineSel').onchange = e => save('engine', e.target.value);
 toggle.addEventListener('click', () => gate.classList.remove('show'));
 document.addEventListener('pointerdown', () => { if (running && $('speak').checked) unlockSpeech(); }, { once: true });
 
