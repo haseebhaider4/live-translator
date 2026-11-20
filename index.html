@@ -116,7 +116,7 @@
     <select id="engineSel">
       <option value="auto">Auto — Whisper if a Groq key is set</option>
       <option value="browser">Built-in (Safari / Chrome speech)</option>
-      <option value="whisper">Whisper via Groq — any language, most reliable on iPhone</option>
+      <option value="whisper">Whisper via Groq — most reliable on iPhone</option>
     </select>
   </label>
   <label>Groq API key <input id="groqKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false"></label>
@@ -128,7 +128,7 @@
     </select>
     <button class="small" id="testVoice" type="button">Test voice</button>
   </label>
-  <p>Whisper records the audio itself and sends short clips to Groq, so it works even when the iPhone refuses the built-in speech recognition, and it understands any language. Free key at console.groq.com → API Keys. The key is stored only on this device.</p>
+  <p>Whisper records the audio itself and sends short clips to Groq, so it works even when the iPhone refuses the built-in speech recognition. Only German is translated; other languages are ignored. Free key at console.groq.com → API Keys. The key is stored only on this device.</p>
 </div>
 <div id="banner"></div>
 <main id="feed">
@@ -498,13 +498,15 @@ function whisperSend(frames, speechMs, rate) {
   if (!el) append(entry);
   entry.className = 'entry pending';
   const wav = toWav(frames.map(f => f.d), rate);
-  const job = transcribe(wav).then(async text => {
+  const job = transcribe(wav).then(async ({ text, language }) => {
     text = (text || '').trim();
     if (!text || HALLUCINATIONS.test(text)) { entry.remove(); return ''; }
+    // German only: anything Whisper hears as another language is ignored.
+    if (language && !/^(german|de)$/i.test(language)) { entry.remove(); note('ignored ' + language); return ''; }
     entry.querySelector('.de').textContent = text;
     const item = { time: new Date(), de: text, en: '' };
     transcript.push(item);
-    const en = await translate(text, 'auto');
+    const en = await translate(text, 'de');
     item.en = en;
     entry.querySelector('.en').textContent = en;
     entry.className = 'entry';
@@ -523,7 +525,7 @@ async function transcribe(wav, retry = true) {
   const fd = new FormData();
   fd.append('file', wav, 'speech.wav');
   fd.append('model', 'whisper-large-v3-turbo');
-  fd.append('response_format', 'json');
+  fd.append('response_format', 'verbose_json');   // includes the detected language
   fd.append('temperature', '0');
   const r = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
     method: 'POST', headers: { Authorization: 'Bearer ' + groqKey() }, body: fd, signal: AbortSignal.timeout(20000)
@@ -535,7 +537,8 @@ async function transcribe(wav, retry = true) {
     return transcribe(wav, false);
   }
   if (!r.ok) { note('Groq error ' + r.status); throw new Error('groq ' + r.status); }
-  return (await r.json()).text;
+  const j = await r.json();
+  return { text: j.text, language: j.language };
 }
 
 // 16 kHz mono 16-bit WAV — small, and exactly what Whisper wants.
