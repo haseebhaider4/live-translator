@@ -1,0 +1,474 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#171b22">
+<meta name="apple-mobile-web-app-title" content="Translator">
+<title>Live Translator</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #171b22; --line: #262c36; --text: #f2f4f7;
+    --muted: #8b95a5; --accent: #4f9cff; --live: #35c46b; --warn: #f0b23c; --stop: #e5534b;
+    --size: 30px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", system-ui, sans-serif;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line);
+  }
+  #toggle {
+    font: inherit; font-weight: 600; font-size: 16px; color: #fff;
+    border: 0; border-radius: 10px; padding: 11px 22px; cursor: pointer;
+    background: var(--live); min-width: 130px;
+  }
+  #toggle.on { background: var(--stop); }
+  #status { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 14px; min-width: 190px; }
+  #dot { width: 10px; height: 10px; border-radius: 50%; background: var(--muted); }
+  #dot.live { background: var(--live); animation: pulse 1.4s infinite; }
+  #dot.wait { background: var(--warn); }
+  #dot.err { background: var(--stop); }
+  @keyframes pulse { 50% { opacity: .35; } }
+  .spacer { flex: 1; }
+  label { color: var(--muted); font-size: 13px; display: flex; align-items: center; gap: 6px; }
+  select, button.small {
+    font: inherit; font-size: 13px; color: var(--text); background: var(--bg);
+    border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; cursor: pointer;
+  }
+  button.small:hover, select:hover { border-color: var(--accent); }
+  input[type=range] { width: 90px; accent-color: var(--accent); }
+  main { flex: 1; overflow-y: auto; padding: 22px max(18px, 6vw) 40px; scroll-behavior: smooth; }
+  .entry { margin: 0 0 20px; }
+  .en { font-size: var(--size); line-height: 1.3; margin: 0; }
+  .de { font-size: calc(var(--size) * .52); line-height: 1.35; color: var(--muted); margin: 4px 0 0; }
+  body.hide-de .de { display: none; }
+  .entry.live .en { color: var(--accent); }
+  .entry.pending .en { color: var(--muted); }
+  #empty { color: var(--muted); font-size: 18px; text-align: center; margin-top: 18vh; line-height: 1.6; }
+  #banner { display: none; background: #3a1d1d; color: #ffc9c5; padding: 10px 18px; font-size: 14px; }
+  footer { padding: 6px 18px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); background: var(--panel); }
+  .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  button, input { touch-action: manipulation; }
+
+  /* phone */
+  @media (max-width: 640px) {
+    header { padding: max(10px, env(safe-area-inset-top)) 12px 10px; gap: 10px; }
+    #toggle { flex: 1; font-size: 19px; padding: 15px; }
+    #status { min-width: 0; flex: 1.3; font-size: 13px; }
+    .spacer, .lang, #save { display: none; }
+    .controls { width: 100%; justify-content: space-between; gap: 10px 12px; }
+    input[type=range] { width: 80px; }
+    main { padding: 16px 14px 40px; }
+    #empty { margin-top: 10vh; font-size: 17px; }
+    footer { padding: 6px 12px max(6px, env(safe-area-inset-bottom)); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <button id="toggle">Start</button>
+  <div id="status"><span id="dot"></span><span id="statusText">Stopped</span></div>
+  <span class="spacer"></span>
+  <label class="lang">German → English</label>
+  <div class="controls">
+    <label><input id="speak" type="checkbox"> Speak English</label>
+    <label>Voice speed <input id="rate" type="range" min="0.8" max="1.8" step="0.1" value="1.1"></label>
+    <label>Text <input id="size" type="range" min="18" max="64" value="30"></label>
+    <label><input id="showDe" type="checkbox" checked> German</label>
+    <button class="small" id="save">Save transcript</button>
+    <button class="small" id="clear">Clear</button>
+  </div>
+</header>
+<div id="banner"></div>
+<main id="feed">
+  <div id="empty">Put your headphones in, press <b>Start</b> and allow the microphone.<br>German around you is shown and spoken in English until you press <b>Stop</b>.<br>Keep the screen on — the phone stops listening when it locks.</div>
+</main>
+<footer id="foot">Ready.</footer>
+
+<script>
+const $ = id => document.getElementById(id);
+const feed = $('feed'), toggle = $('toggle'), dot = $('dot'), statusText = $('statusText');
+let SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+
+let running = false;        // user wants it on
+let session = null;         // the one live recognition session
+let everStarted = false, lastIssue = '', lastDropAt = 0;
+let RESTART_GAP_MS = 300, START_TIMEOUT_MS = 6000, QUIET_MS = 20000, STUCK_MS = 8000, MAX_AGE_MS = 60000, TRANSLATE_TIMEOUT_MS = 4000;
+let PAUSE_COMMIT_MS = 1300;   // a pause this long ends a sentence (iPhone rarely marks sentences final itself)
+let MAX_SPEAK_BACKLOG = 2;    // if speech falls behind, skip older lines so you hear what is said now
+let blockedFails = 0;
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const IS_PHONE = matchMedia('(pointer: coarse)').matches;
+let startedAt = 0, restarts = 0;
+let liveEl = null, liveText = '';
+let interimSeq = 0, interimTimer = null, lastInterimAt = 0;
+let translator = null, engine = '';
+let wakeLock = null;
+const transcript = [];      // {time, de, en}
+const MAX_DOM = 400;
+
+/* ---------- translation ---------- */
+const src = () => 'de';
+
+const withTimeout = (p, ms) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error('timeout')), ms))]);
+let initing = false, translatorResets = 0;
+
+// The on-device translator can hang (e.g. on speech that is not German). Because it
+// handles requests one after another, one hung request would block every later line.
+// So: drop it, carry on with the online service, and build a fresh one in the background.
+function resetTranslator(why) {
+  const t = translator;
+  if (!t) return;
+  translator = null; engine = 'online'; translatorResets++;
+  try { t.destroy(); } catch {}
+  note('translator restarted (' + why + ')');
+  if (running && translatorResets < 20) initTranslator();
+}
+
+// Health check every 10 seconds while running.
+setInterval(() => {
+  const t = translator;
+  if (!running || !t) return;
+  withTimeout(t.translate('Guten Tag'), TRANSLATE_TIMEOUT_MS).catch(() => { if (t === translator) resetTranslator('health check'); });
+}, 10000);
+
+async function initTranslator() {
+  if (initing) return;
+  initing = true;
+  try { await initTranslatorInner(); } finally { initing = false; }
+}
+async function initTranslatorInner() {
+  translator = null; engine = 'online';
+  if ('Translator' in self) {
+    try {
+      const pair = { sourceLanguage: src(), targetLanguage: 'en' };
+      if (await Translator.availability(pair) !== 'unavailable') {
+        translator = await Translator.create({ ...pair, monitor(m) {
+          m.addEventListener('downloadprogress', e => setFoot(`Downloading offline translation model… ${Math.round(e.loaded * 100)}%`));
+        }});
+        engine = 'on-device';
+      }
+    } catch (e) { console.warn('Built-in translator unavailable, using online', e); }
+  }
+  setFoot();
+}
+
+async function translate(text) {
+  if (!text.trim()) return '';
+  if (translator) {
+    const t = translator;
+    try { return await withTimeout(t.translate(text), TRANSLATE_TIMEOUT_MS); }
+    catch (e) { if (t === translator) resetTranslator(e.message === 'timeout' ? 'no response' : 'error'); }
+  }
+  const q = encodeURIComponent(text);
+  try {
+    const r = await fetch(`https://translate.googleapis.com/translate_a/single?client=gtx&sl=${src()}&tl=en&dt=t&q=${q}`, { signal: AbortSignal.timeout(6000) });
+    if (!r.ok) throw new Error(r.status);
+    const j = await r.json();
+    return j[0].map(x => x[0]).join('');
+  } catch (e) {
+    const r = await fetch(`https://api.mymemory.translated.net/get?q=${q}&langpair=${src()}|en`, { signal: AbortSignal.timeout(6000) });
+    const j = await r.json();
+    return j.responseData.translatedText;
+  }
+}
+
+/* ---------- rendering ---------- */
+function nearBottom() { return feed.scrollHeight - feed.scrollTop - feed.clientHeight < 160; }
+function makeEntry(cls) {
+  $('empty')?.remove();
+  const el = document.createElement('div');
+  el.className = 'entry ' + cls;
+  el.innerHTML = '<p class="en"></p><p class="de"></p>';
+  return el;
+}
+function append(el) {
+  const stick = nearBottom();
+  feed.appendChild(el);
+  while (feed.children.length > MAX_DOM) feed.firstElementChild.remove();
+  if (stick) feed.scrollTop = feed.scrollHeight;
+}
+
+function commitFinal(text) {
+  text = text.trim();
+  if (!text) return;
+  const el = liveEl || makeEntry('');
+  if (!liveEl) append(el);
+  liveEl = null; liveText = ''; interimSeq++;
+  el.className = 'entry pending';
+  el.querySelector('.de').textContent = text;
+  if (!el.querySelector('.en').textContent) el.querySelector('.en').textContent = '…';
+  const item = { time: new Date(), de: text, en: '' };
+  transcript.push(item);
+  translate(text).then(en => {
+    item.en = en;
+    speak(en);
+    setFoot();
+    const stick = nearBottom();
+    el.querySelector('.en').textContent = en;
+    el.className = 'entry';
+    if (stick) feed.scrollTop = feed.scrollHeight;
+  }).catch(() => {
+    el.querySelector('.en').textContent = '(translation failed — check internet)';
+  });
+}
+
+function showInterim(text) {
+  liveText = text;
+  if (!text.trim()) return;
+  if (!liveEl) { liveEl = makeEntry('live'); liveEl.querySelector('.en').textContent = '…'; append(liveEl); }
+  liveEl.querySelector('.de').textContent = text;
+  if (nearBottom()) feed.scrollTop = feed.scrollHeight;
+  // translate the in-progress sentence at most ~3x per second
+  const wait = Math.max(0, 350 - (Date.now() - lastInterimAt));
+  clearTimeout(interimTimer);
+  interimTimer = setTimeout(() => {
+    lastInterimAt = Date.now();
+    const seq = ++interimSeq, el = liveEl;
+    translate(text).then(en => {
+      if (seq === interimSeq && el === liveEl && el) {
+        el.querySelector('.en').textContent = en;
+        if (nearBottom()) feed.scrollTop = feed.scrollHeight;
+      }
+    }).catch(() => {});
+  }, wait);
+}
+
+/* ---------- speaking English into the headphones ---------- */
+const synth = window.speechSynthesis;
+const speakQueue = [];
+let speakingNow = null, speakStartedAt = 0, voice = null;
+
+function pickVoice() {
+  const en = (synth?.getVoices() || []).filter(v => /^en[-_]/i.test(v.lang));
+  const main = en.filter(v => /^en[-_](US|GB)/i.test(v.lang));
+  voice = main.find(v => /Samantha|Daniel|Google US English|Aria|Jenny|Ava/i.test(v.name))
+       || main.find(v => v.localService) || main[0] || en[0] || null;
+}
+if (synth) { pickVoice(); synth.addEventListener?.('voiceschanged', pickVoice); }
+
+function speak(text) {
+  if (!synth || !running || !$('speak').checked || !text?.trim()) return;
+  speakQueue.push(text);
+  while (speakQueue.length > MAX_SPEAK_BACKLOG) speakQueue.shift();   // still shown on screen
+  pump();
+}
+function pump() {
+  if (speakingNow || !speakQueue.length) return;
+  const u = new SpeechSynthesisUtterance(speakQueue.shift());
+  u.lang = voice?.lang || 'en-US';
+  if (voice) u.voice = voice;
+  u.rate = +$('rate').value;
+  speakingNow = u; speakStartedAt = Date.now();
+  const done = () => { if (speakingNow === u) { speakingNow = null; pump(); } };
+  u.onend = done; u.onerror = done;
+  synth.speak(u);
+}
+// iPhone only allows speech that starts from a tap, so speak a silent blip inside the Start tap.
+function unlockSpeech() {
+  if (!synth) return;
+  try { synth.cancel(); speakingNow = null; const u = new SpeechSynthesisUtterance(' '); u.volume = 0; synth.speak(u); } catch {}
+}
+function stopSpeaking() { speakQueue.length = 0; speakingNow = null; try { synth?.cancel(); } catch {} }
+function speechWatchdog() {
+  if (!synth) return;
+  if (synth.paused) synth.resume();
+  if (speakingNow && Date.now() - speakStartedAt > 15000) { speakingNow = null; synth.cancel(); pump(); }   // stuck voice
+}
+
+/* ---------- always-on listening ---------- */
+// Speech that the recogniser repeats after we already showed it (on a pause) is cut off here.
+const norm = t => t.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+function stripConsumed(s, text) {
+  const c = norm(s.consumed || '');
+  if (!c) return text;
+  const t = norm(text);
+  if (c.startsWith(t)) return '';
+  const n = c.split(' ').length, words = text.trim().split(/\s+/);
+  if (norm(words.slice(0, n).join(' ')) === c) return words.slice(n).join(' ');
+  return text;
+}
+
+function setStatus(kind, text) { dot.className = kind; statusText.textContent = text; }
+function setFoot(msg) {
+  $('foot').textContent = msg || (engine
+    ? `Translation: ${engine === 'on-device' ? 'on-device (private, works offline)' : 'online service'} · Lines: ${transcript.length} · Auto-reconnects: ${restarts}${lastIssue ? ' · Last issue: ' + lastIssue : ''}`
+    : 'Ready.');
+}
+function banner(msg) { $('banner').style.display = msg ? 'block' : 'none'; $('banner').textContent = msg || ''; }
+function note(issue) { lastIssue = `${issue} at ${new Date().toLocaleTimeString()}`; setFoot(); }
+
+// Exactly one session exists at a time. Events from any older recognizer are ignored,
+// so a slow or dead one can never leave the app thinking it is still listening.
+function startSession() {
+  if (!running || session) return;
+  const r = new SR();
+  r.lang = 'de-DE';
+  r.continuous = true;
+  r.interimResults = true;
+  r.maxAlternatives = 1;
+  const s = session = { rec: r, createdAt: Date.now(), started: false, lastEventAt: Date.now() };
+  const mine = () => session === s;
+
+  r.onstart = () => {
+    if (!mine()) return;
+    s.started = true; everStarted = true; blockedFails = 0; s.lastEventAt = Date.now();
+    banner(''); setStatus('live', 'Listening…');
+  };
+  r.onresult = e => {
+    if (!mine()) return;
+    s.lastEventAt = Date.now();
+    let interim = '';
+    for (let i = e.resultIndex; i < e.results.length; i++) {
+      const res = e.results[i];
+      if (res.isFinal) { const t = stripConsumed(s, res[0].transcript); s.consumed = ''; commitFinal(t); }
+      else interim += res[0].transcript;
+    }
+    s.rawInterim = interim;
+    showInterim(stripConsumed(s, interim));
+    // End the sentence on a short pause, so it is translated and spoken right away.
+    clearTimeout(s.pauseTimer);
+    if (liveText.trim()) s.pauseTimer = setTimeout(() => {
+      if (!mine() || !liveText.trim()) return;
+      s.consumed = s.rawInterim;
+      commitFinal(liveText);
+    }, PAUSE_COMMIT_MS);
+  };
+  r.onerror = e => {
+    if (!mine()) return;
+    if (e.error === 'no-speech' || e.error === 'aborted') return;   // normal; onend restarts
+    note(e.error);
+    if (e.error === 'not-allowed' || e.error === 'service-not-allowed') {
+      if (!everStarted) {
+        stop();
+        setStatus('err', 'Microphone blocked');
+        banner(IS_IOS
+          ? 'Microphone or speech recognition is blocked. On iPhone: Settings → Apps → Safari → Microphone → Allow, and Settings → General → Keyboard → turn on Enable Dictation. Then reload this page and tap Start.'
+          : 'Microphone access was blocked. Click the icon at the left of the address bar, allow the microphone, then press Start.');
+      } else if (++blockedFails >= 3) {
+        stop();
+        banner('The phone paused listening (screen locked or app switched). Tap Start to continue.');
+      }
+    } else if (e.error === 'audio-capture') {
+      setStatus('err', 'No microphone found');
+      banner('No microphone detected. Check your sound settings — retrying automatically.');
+    } else if (e.error === 'network') {
+      setStatus('wait', 'No internet — retrying…');
+    } else {
+      setStatus('wait', 'Reconnecting…');
+    }
+  };
+  r.onend = () => { if (mine()) dropSession(); };
+  try { r.start(); } catch (e) { session = null; lastDropAt = Date.now(); note('start failed'); }
+}
+
+// Abandon the current session (ended, stalled or deaf). The watchdog starts a fresh one.
+function dropSession(issue) {
+  const s = session;
+  if (!s) return;
+  session = null; lastDropAt = Date.now();
+  s.rec.onstart = s.rec.onresult = s.rec.onerror = s.rec.onend = null;
+  try { s.rec.abort(); } catch {}
+  if (liveText.trim()) commitFinal(liveText);   // never lose a half-finished sentence
+  if (running) {
+    restarts++;
+    if (issue) note(issue); else setFoot();
+    if (dot.className === 'live') setStatus('wait', 'Reconnecting…');
+  }
+}
+
+async function start() {
+  if (!SR) { banner(noSRMessage()); return; }
+  running = true; startedAt = Date.now(); blockedFails = 0;
+  toggle.textContent = 'Stop'; toggle.classList.add('on');
+  setStatus('wait', 'Starting…');
+  banner('');
+  unlockSpeech();             // must happen inside the tap on iPhone
+  initTranslator();           // runs alongside; online translation covers the gap
+  startSession();
+  try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+}
+
+function stop() {
+  running = false;
+  dropSession();
+  stopSpeaking();
+  toggle.textContent = 'Start'; toggle.classList.remove('on');
+  setStatus('', 'Stopped');
+  wakeLock?.release().catch(() => {}); wakeLock = null;
+}
+
+// Watchdog, once a second: restart after a drop, and replace a session that never
+// started or has gone silent (Chrome sometimes keeps "listening" but stops hearing).
+setInterval(() => {
+  if (!running) return;
+  speechWatchdog();
+  const now = Date.now(), s = session;
+  if (!s) {
+    if (now - lastDropAt >= RESTART_GAP_MS) startSession();
+  } else if (!s.started) {
+    if (now - s.createdAt > START_TIMEOUT_MS) dropSession('start timed out');
+  } else if (now - s.lastEventAt > (liveText.trim() ? STUCK_MS : QUIET_MS)) {
+    dropSession(liveText.trim() ? 'stalled mid-sentence' : '');
+  } else if (!liveText.trim() && now - s.createdAt > MAX_AGE_MS) {
+    dropSession('');            // routine refresh during a pause, so a session never goes stale
+  }
+  if (session?.started && dot.className === 'live') {
+    const sec = Math.floor((now - startedAt) / 1000);
+    statusText.textContent = 'Listening… ' + [Math.floor(sec / 3600), Math.floor(sec / 60) % 60, sec % 60].map(n => String(n).padStart(2, '0')).join(':');
+  }
+}, 1000);
+
+window.addEventListener('online', () => { if (running) dropSession('internet came back'); });
+
+document.addEventListener('visibilitychange', async () => {
+  if (running && document.visibilityState === 'visible') {
+    try { wakeLock = await navigator.wakeLock?.request('screen'); } catch {}
+  }
+});
+
+/* ---------- controls ---------- */
+toggle.onclick = () => running ? stop() : start();
+$('size').oninput = e => { document.documentElement.style.setProperty('--size', e.target.value + 'px'); save('size', e.target.value); };
+$('showDe').onchange = e => { document.body.classList.toggle('hide-de', !e.target.checked); save('showDe', e.target.checked ? '1' : '0'); };
+$('clear').onclick = () => { feed.innerHTML = ''; transcript.length = 0; liveEl = null; liveText = ''; setFoot(); };
+$('save').onclick = () => {
+  if (!transcript.length) return;
+  const text = transcript.map(t => `[${t.time.toLocaleTimeString()}]\nEN: ${t.en}\nDE: ${t.de}\n`).join('\n');
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
+  a.download = `transcript-${new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-')}.txt`;
+  a.click();
+};
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && !/INPUT|SELECT|BUTTON/.test(document.activeElement.tagName)) { e.preventDefault(); toggle.click(); }
+});
+
+$('speak').onchange = e => { save('speak', e.target.checked ? '1' : '0'); if (!e.target.checked) stopSpeaking(); };
+$('rate').oninput = e => save('rate', e.target.value);
+
+function noSRMessage() {
+  return IS_IOS
+    ? 'Speech recognition is not available here. Open this page in Safari (iOS 14.5 or newer) and turn on Settings → General → Keyboard → Enable Dictation.'
+    : 'This browser has no speech recognition. Open this page in Google Chrome.';
+}
+function save(k, v) { try { localStorage.setItem('lt-' + k, v); } catch {} }
+function load(k) { try { return localStorage.getItem('lt-' + k); } catch { return null; } }
+if (!load('size') && IS_PHONE) $('size').value = 26;
+if (load('size')) $('size').value = load('size');
+$('size').oninput({ target: $('size') });
+if (load('showDe') === '0') { $('showDe').checked = false; document.body.classList.add('hide-de'); }
+// Speak by default on phones (headphones); off on laptops so speakers don't feed back into the mic.
+$('speak').checked = load('speak') ? load('speak') === '1' : IS_PHONE;
+if (load('rate')) $('rate').value = load('rate');
+if (!synth) $('speak').closest('label').style.display = 'none';
+if (!SR) banner(noSRMessage());
+</script>
+</body>
+</html>
