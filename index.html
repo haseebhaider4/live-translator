@@ -54,6 +54,19 @@
   #banner { display: none; background: #3a1d1d; color: #ffc9c5; padding: 10px 18px; font-size: 14px; }
   footer { padding: 6px 18px; font-size: 12px; color: var(--muted); border-top: 1px solid var(--line); background: var(--panel); }
   .controls { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+  #gate {
+    position: fixed; inset: 0; z-index: 10; display: none; cursor: pointer;
+    flex-direction: column; align-items: center; justify-content: center; gap: 18px;
+    background: rgba(14, 17, 22, .96); text-align: center; padding: 24px;
+  }
+  #gate.show { display: flex; }
+  #gate .big {
+    width: 170px; height: 170px; border-radius: 50%; background: var(--live); color: #fff;
+    display: flex; align-items: center; justify-content: center; font-size: 26px; font-weight: 700;
+    box-shadow: 0 0 0 14px rgba(53, 196, 107, .18);
+  }
+  #gate p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; max-width: 340px; }
+  #gate b { color: var(--text); }
   button, input { touch-action: manipulation; }
 
   /* phone */
@@ -90,6 +103,11 @@
   <div id="empty">Put your headphones in, press <b>Start</b> and allow the microphone.<br>German around you is shown and spoken in English until you press <b>Stop</b>.<br>Keep the screen on — the phone stops listening when it locks.</div>
 </main>
 <footer id="foot">Ready.</footer>
+<div id="gate">
+  <div class="big">Tap to start</div>
+  <p><b>Tap anywhere.</b> If asked, allow the <b>microphone</b> and <b>speech recognition</b> — that's all.</p>
+  <p id="gateNote"></p>
+</div>
 
 <script>
 const $ = id => document.getElementById(id);
@@ -469,6 +487,42 @@ $('speak').checked = load('speak') ? load('speak') === '1' : IS_PHONE;
 if (load('rate')) $('rate').value = load('rate');
 if (!synth) $('speak').closest('label').style.display = 'none';
 if (!SR) banner(noSRMessage());
+
+/* ---------- permissions on open ---------- */
+// Ask for the microphone the moment the page opens. Phones only allow speech recognition
+// and the English voice to start from a tap, so a full-screen "Tap to start" covers the rest
+// in one touch. On a laptop with the microphone already allowed, it starts by itself.
+const gate = $('gate');
+function showGate(note) { $('gateNote').textContent = note || ''; gate.classList.add('show'); }
+gate.onclick = () => { gate.classList.remove('show'); if (!running) start(); };
+toggle.addEventListener('click', () => gate.classList.remove('show'));
+document.addEventListener('pointerdown', () => { if (running && $('speak').checked) unlockSpeech(); }, { once: true });
+
+async function askMicrophone() {
+  if (!navigator.mediaDevices?.getUserMedia) return 'unknown';
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    stream.getTracks().forEach(t => t.stop());   // only needed the permission; recognition opens its own
+    return 'granted';
+  } catch (e) {
+    return e.name === 'NotAllowedError' || e.name === 'SecurityError' ? 'denied' : 'unknown';
+  }
+}
+
+async function onOpen() {
+  if (!SR) return;
+  let already = false;
+  try { already = (await navigator.permissions?.query({ name: 'microphone' }))?.state === 'granted'; } catch {}
+  if (already && !IS_PHONE) { start(); return; }      // laptop: go straight to listening
+  showGate();
+  const mic = await askMicrophone();
+  if (mic === 'denied') {
+    showGate(IS_IOS
+      ? 'Microphone was blocked. Tap "aA" in the address bar → Website Settings → Microphone → Allow, then reload.'
+      : 'Microphone was blocked. Click the icon left of the address bar → allow Microphone, then reload.');
+  }
+}
+onOpen();
 </script>
 </body>
 </html>
