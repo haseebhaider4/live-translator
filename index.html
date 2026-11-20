@@ -67,6 +67,11 @@
   }
   #gate p { margin: 0; color: var(--muted); font-size: 15px; line-height: 1.5; max-width: 340px; }
   #gate b { color: var(--text); }
+  #lockForm { display: none; flex-direction: column; gap: 12px; width: min(320px, 100%); }
+  #gate.locked #lockForm { display: flex; }
+  #gate.locked .big, #gate.locked .tapHint, #gate.locked .link { display: none; }
+  #lockForm input { font: inherit; font-size: 18px; padding: 14px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); text-align: center; }
+  #lockForm button { font: inherit; font-size: 18px; font-weight: 600; padding: 14px; border: 0; border-radius: 10px; background: var(--accent); color: #fff; cursor: pointer; }
   #gate .link { color: var(--accent); text-decoration: underline; font-size: 15px; background: none; border: 0; padding: 8px; cursor: pointer; }
   #settings { display: none; flex-direction: column; gap: 10px; padding: 12px 18px; background: var(--panel); border-bottom: 1px solid var(--line); }
   #settings.show { display: flex; }
@@ -115,6 +120,14 @@
     </select>
   </label>
   <label>Groq API key <input id="groqKey" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false"></label>
+  <label>Voice
+    <select id="voiceSel">
+      <option value="auto">Auto — phone voice, Groq voice if the phone stays silent</option>
+      <option value="phone">Phone voice (free)</option>
+      <option value="groq">Groq natural voice — best on iPhone</option>
+    </select>
+    <button class="small" id="testVoice" type="button">Test voice</button>
+  </label>
   <p>Whisper records the audio itself and sends short clips to Groq, so it works even when the iPhone refuses the built-in speech recognition, and it understands any language. Free key at console.groq.com → API Keys. The key is stored only on this device.</p>
 </div>
 <div id="banner"></div>
@@ -124,7 +137,12 @@
 <footer id="foot">Ready.</footer>
 <div id="gate">
   <div class="big">Tap to start</div>
-  <p><b>Tap anywhere.</b> If asked, allow the <b>microphone</b> and <b>speech recognition</b> — that's all.</p>
+  <form id="lockForm" autocomplete="on">
+    <input type="text" name="username" value="live-translator" autocomplete="username" hidden>
+    <input id="pw" type="password" placeholder="Password" autocomplete="current-password">
+    <button id="unlockBtn" type="submit">Unlock</button>
+  </form>
+  <p class="tapHint"><b>Tap anywhere.</b> If asked, allow the <b>microphone</b> and <b>speech recognition</b> — that's all.</p>
   <p id="gateNote"></p>
   <button class="link" id="gateSettings">Settings</button>
 </div>
@@ -291,33 +309,107 @@ function pickVoice() {
 }
 if (synth) { pickVoice(); synth.addEventListener?.('voiceschanged', pickVoice); }
 
-function speak(text) {
-  if (!synth || !running || !$('speak').checked || !text?.trim()) return;
+// Two voices: the phone's own (free) and Groq's natural voice (plays as normal audio, which
+// iPhone allows even while the microphone records). Auto uses the phone voice and switches to
+// Groq's if the phone voice stays silent.
+let phoneVoiceBroken = false, groqVoiceOk = null, outCtx = null, voiceUsed = '';
+const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english', GROQ_TTS_VOICES = ['hannah', 'diana', 'autumn', 'troy'];
+let groqVoiceIdx = 0;
+
+function voiceMode() {
+  const pref = $('voiceSel').value, canGroq = !!groqKey() && groqVoiceOk !== false;
+  if (pref === 'groq') return canGroq ? 'groq' : 'phone';
+  if (pref === 'phone' || !synth) return synth ? 'phone' : (canGroq ? 'groq' : 'none');
+  return phoneVoiceBroken && canGroq ? 'groq' : 'phone';
+}
+
+function speak(text, force) {
+  if (!text?.trim() || (!force && (!running || !$('speak').checked))) return;
   speakQueue.push(text);
   while (speakQueue.length > MAX_SPEAK_BACKLOG) speakQueue.shift();   // still shown on screen
   pump();
 }
 function pump() {
   if (speakingNow || !speakQueue.length) return;
-  const u = new SpeechSynthesisUtterance(speakQueue.shift());
+  const text = speakQueue.shift(), token = {};
+  speakingNow = token; speakStartedAt = Date.now();
+  const done = () => { if (speakingNow === token) { speakingNow = null; pump(); } };
+  const mode = voiceMode();
+  if (mode === 'groq') groqSpeak(text).then(done, () => (synth ? phoneSpeak(text, token, done) : done()));
+  else if (mode === 'phone') phoneSpeak(text, token, done);
+  else done();
+}
+
+function phoneSpeak(text, token, done) {
+  voiceUsed = 'phone';
+  const u = new SpeechSynthesisUtterance(text);
   u.lang = voice?.lang || 'en-US';
   if (voice) u.voice = voice;
   u.rate = +$('rate').value;
-  speakingNow = u; speakStartedAt = Date.now();
-  const done = () => { if (speakingNow === u) { speakingNow = null; pump(); } };
+  let started = false;
+  u.onstart = () => { started = true; };
   u.onend = done; u.onerror = done;
   synth.speak(u);
+  setTimeout(() => {
+    if (started || speakingNow !== token) return;
+    // The phone voice never started — common on iPhone while the microphone is recording.
+    phoneVoiceBroken = true; try { synth.cancel(); } catch {}
+    note('phone voice silent');
+    if (groqKey() && groqVoiceOk !== false && $('voiceSel').value !== 'phone') groqSpeak(text).then(done, done);
+    else { banner('The phone voice is not playing.', 'Turn the silent switch off, or in Settings choose "Groq natural voice".'); done(); }
+  }, 2500);
 }
-// iPhone only allows speech that starts from a tap, so speak a silent blip inside the Start tap.
+
+async function groqSpeak(text) {
+  voiceUsed = 'groq';
+  const r = await fetch('https://api.groq.com/openai/v1/audio/speech', {
+    method: 'POST', signal: AbortSignal.timeout(15000),
+    headers: { Authorization: 'Bearer ' + groqKey(), 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: GROQ_TTS_MODEL, input: text.slice(0, 200), voice: GROQ_TTS_VOICES[groqVoiceIdx], response_format: 'wav' })
+  });
+  if (!r.ok) {
+    const err = (await r.json().catch(() => ({}))).error || {};
+    if (/voice/i.test(err.message || '') && groqVoiceIdx < GROQ_TTS_VOICES.length - 1) { groqVoiceIdx++; return groqSpeak(text); }
+    groqVoiceOk = false;
+    if (err.code === 'model_terms_required') {
+      banner('Groq\'s voice needs a one-time OK from you.', 'Open console.groq.com/playground?model=canopylabs/orpheus-v1-english, accept the terms, then reload this page.');
+    }
+    note('Groq voice ' + (err.code || r.status));
+    throw new Error('groq voice');
+  }
+  groqVoiceOk = true;
+  const ctx = (W.ctx && W.ctx.state === 'running') ? W.ctx : outCtx;
+  if (!ctx) throw new Error('no audio');
+  if (ctx.state !== 'running') { await Promise.race([ctx.resume(), new Promise(r => setTimeout(r, 1000))]); }
+  if (ctx.state !== 'running') throw new Error('audio locked');
+  const audio = await ctx.decodeAudioData(await r.arrayBuffer());
+  await new Promise(res => {
+    const s = ctx.createBufferSource();
+    s.buffer = audio; s.connect(ctx.destination); s.onended = res; s.start();
+  });
+}
+
+// iPhone only plays sound that starts from a tap, so everything is unlocked inside the Start tap.
 function unlockSpeech() {
+  // Let speech play through headphones while recording, even with the silent switch on.
+  try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch {}
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!outCtx) outCtx = new AC();
+    outCtx.resume();
+    const b = outCtx.createBufferSource(); b.buffer = outCtx.createBuffer(1, 1, 22050); b.connect(outCtx.destination); b.start();
+  } catch {}
   if (!synth) return;
   try { synth.cancel(); speakingNow = null; const u = new SpeechSynthesisUtterance(' '); u.volume = 0; synth.speak(u); } catch {}
 }
-function stopSpeaking() { speakQueue.length = 0; speakingNow = null; try { synth?.cancel(); } catch {} }
+function stopSpeaking() {
+  speakQueue.length = 0; speakingNow = null;
+  try { synth?.cancel(); } catch {}
+  try { if (navigator.audioSession) navigator.audioSession.type = 'auto'; } catch {}
+}
 function speechWatchdog() {
-  if (!synth) return;
-  if (synth.paused) synth.resume();
-  if (speakingNow && Date.now() - speakStartedAt > 15000) { speakingNow = null; synth.cancel(); pump(); }   // stuck voice
+  if (synth?.paused) synth.resume();
+  if (speakingNow && Date.now() - speakStartedAt > 25000) { speakingNow = null; try { synth?.cancel(); } catch {} pump(); }   // stuck voice
 }
 
 /* ---------- choosing the speech engine ---------- */
@@ -482,7 +574,7 @@ function stripConsumed(s, text) {
 function setStatus(kind, text) { dot.className = kind; statusText.textContent = text; }
 function setFoot(msg) {
   $('foot').textContent = msg || (engine
-    ? `Speech: ${engineMode === 'whisper' ? 'Whisper (Groq)' : 'built-in'} · Translation: ${engine === 'on-device' ? 'on-device' : 'online'} · Lines: ${transcript.length} · Reconnects: ${restarts}${lastIssue ? ' · Last issue: ' + lastIssue : ''}`
+    ? `Speech: ${engineMode === 'whisper' ? 'Whisper (Groq)' : 'built-in'} · Voice: ${!$('speak').checked ? 'off' : voiceUsed || voiceMode()} · Translation: ${engine === 'on-device' ? 'on-device' : 'online'} · Lines: ${transcript.length} · Reconnects: ${restarts}${lastIssue ? ' · Last issue: ' + lastIssue : ''}`
     : 'Ready.');
 }
 function banner(msg, detail) {
@@ -582,7 +674,8 @@ function dropSession(issue) {
 }
 
 async function start() {
-  if (!SR) { banner(noSRMessage()); return; }
+  if (locked) { showGate(); return; }
+  if (!SR && !groqKey()) { banner(noSRMessage()); return; }
   running = true; startedAt = Date.now(); blockedFails = 0;
   toggle.textContent = 'Stop'; toggle.classList.add('on');
   setStatus('wait', 'Starting…');
@@ -689,13 +782,48 @@ if (!SR) banner(noSRMessage());
 // in one touch. On a laptop with the microphone already allowed, it starts by itself.
 const gate = $('gate');
 function showGate(note) { $('gateNote').textContent = note || ''; gate.classList.add('show'); }
-gate.onclick = () => { gate.classList.remove('show'); if (!running) start(); else W.ctx?.resume(); };
+gate.onclick = e => {
+  if (locked || e.target.closest('#lockForm')) return;
+  gate.classList.remove('show'); if (!running) start(); else W.ctx?.resume();
+};
+
+/* ---------- password lock: the Groq key is published only in encrypted form ---------- */
+let vault = null, locked = false;
+const b64 = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+async function loadVault() {
+  try { const r = await fetch('vault.json', { cache: 'no-store' }); if (r.ok) vault = await r.json(); } catch {}
+}
+async function openVault(pw) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(pw), 'PBKDF2', false, ['deriveKey']);
+  const key = await crypto.subtle.deriveKey({ name: 'PBKDF2', salt: b64(vault.salt), iterations: vault.iter, hash: 'SHA-256' },
+    base, { name: 'AES-GCM', length: 256 }, false, ['decrypt']);
+  return new TextDecoder().decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64(vault.iv) }, key, b64(vault.data)));
+}
+const vaultId = () => vault.data.slice(0, 24);
+function showLock(note) { locked = true; gate.classList.add('locked'); showGate(note || 'Enter your password to unlock the translator.'); }
+$('lockForm').onsubmit = async e => {
+  e.preventDefault();
+  $('unlockBtn').disabled = true; $('gateNote').textContent = 'Unlocking…';
+  try {
+    const key = await openVault($('pw').value);
+    $('groqKey').value = key; save('groqKey', key); save('vaultId', vaultId());
+    $('engineSel').value = 'auto'; save('engine', 'auto');
+    locked = false; gate.classList.remove('locked'); $('pw').value = '';
+    showGate('Unlocked — this phone will remember it.');
+  } catch {
+    $('gateNote').textContent = 'Wrong password. Try again.';
+  }
+  $('unlockBtn').disabled = false;
+};
 $('gateSettings').onclick = e => { e.stopPropagation(); gate.classList.remove('show'); $('settings').classList.add('show'); $('groqKey').focus(); };
 $('settingsBtn').onclick = () => $('settings').classList.toggle('show');
 $('groqKey').value = load('groqKey') || '';
 $('engineSel').value = load('engine') || 'auto';
 $('groqKey').onchange = e => save('groqKey', e.target.value.trim());
 $('engineSel').onchange = e => save('engine', e.target.value);
+$('voiceSel').value = load('voice') || 'auto';
+$('voiceSel').onchange = e => { save('voice', e.target.value); groqVoiceOk = null; phoneVoiceBroken = false; };
+$('testVoice').onclick = () => { if (!running) unlockSpeech(); speak('Voice test. If you can hear this, the translation will be read out.', true); };
 toggle.addEventListener('click', () => gate.classList.remove('show'));
 document.addEventListener('pointerdown', () => { if (running && $('speak').checked) unlockSpeech(); }, { once: true });
 
@@ -711,9 +839,11 @@ async function askMicrophone() {
 }
 
 async function onOpen() {
-  if (!SR) return;
+  await loadVault();
+  if (vault && load('vaultId') !== vaultId()) { showLock(); askMicrophone(); return; }
   let already = false;
   try { already = (await navigator.permissions?.query({ name: 'microphone' }))?.state === 'granted'; } catch {}
+  if (!SR && !groqKey()) return;
   if (already && !IS_PHONE) { start(); return; }      // laptop: go straight to listening
   showGate();
   const mic = await askMicrophone();
