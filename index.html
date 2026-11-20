@@ -4,7 +4,6 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#171b22">
-<meta name="referrer" content="no-referrer">
 <meta name="apple-mobile-web-app-title" content="Translator">
 <title>Live Translator</title>
 <style>
@@ -284,7 +283,6 @@ function append(el) {
 function commitFinal(text) {
   text = text.trim();
   if (!text) return;
-  if (isEcho(text)) { liveEl?.remove(); liveEl = null; liveText = ''; interimSeq++; return; }
   const el = liveEl || makeEntry('');
   if (!liveEl) append(el);
   liveEl = null; liveText = ''; interimSeq++;
@@ -343,7 +341,7 @@ if (synth) { pickVoice(); synth.addEventListener?.('voiceschanged', pickVoice); 
 // Two voices: the phone's own (free) and Groq's natural voice (plays as normal audio, which
 // iPhone allows even while the microphone records). Auto uses the phone voice and switches to
 // Groq's if the phone voice stays silent.
-let phoneVoiceBroken = false, groqVoiceOk = null, outCtx = null, voiceUsed = '', groqSource = null;
+let phoneVoiceBroken = false, groqVoiceOk = null, outCtx = null, voiceUsed = '';
 const GROQ_TTS_MODEL = 'canopylabs/orpheus-v1-english', GROQ_TTS_VOICES = ['hannah', 'diana', 'autumn', 'troy'];
 let groqVoiceIdx = 0;
 
@@ -415,8 +413,8 @@ async function groqSpeak(text) {
   if (ctx.state !== 'running') throw new Error('audio locked');
   const audio = await ctx.decodeAudioData(await r.arrayBuffer());
   await new Promise(res => {
-    const s = groqSource = ctx.createBufferSource();
-    s.buffer = audio; s.connect(ctx.destination); s.onended = () => { if (groqSource === s) groqSource = null; res(); }; s.start();
+    const s = ctx.createBufferSource();
+    s.buffer = audio; s.connect(ctx.destination); s.onended = res; s.start();
   });
 }
 
@@ -424,7 +422,6 @@ async function groqSpeak(text) {
 function unlockSpeech() {
   // Let speech play through headphones while recording, even with the silent switch on.
   try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch {}
-  if (typeof unlockReplyAudio === 'function') unlockReplyAudio();
   try {
     const AC = window.AudioContext || window.webkitAudioContext;
     if (!outCtx) outCtx = new AC();
@@ -540,7 +537,6 @@ function whisperSend(frames, speechMs, rate) {
     if (!text || HALLUCINATIONS.test(text)) { entry.remove(); return ''; }
     // German only: anything Whisper hears as another language is ignored.
     if (language && !/^(german|de)$/i.test(language)) { entry.remove(); note('ignored ' + language); return ''; }
-    if (isEcho(text)) { entry.remove(); note('ignored your own reply'); return ''; }
     entry.querySelector('.de').textContent = text;
     const item = { time: new Date(), de: text, en: '' };
     transcript.push(item);
@@ -865,7 +861,7 @@ $('replyText').oninput = () => {
 $('replyText').addEventListener('keydown', e => {
   if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); playReply(); }
 });
-$('playReply').onclick = () => { if (replyDeFor !== $('replyText').value.trim()) unlockReplyAudio(); playReply(); };
+$('playReply').onclick = () => playReply();
 $('closeReply').onclick = closeReply;
 
 async function playReply() {
@@ -889,80 +885,34 @@ async function playReply() {
   }
 }
 
-/* Your own reply must never be translated back: listening is paused from the tap until the
-   German has finished playing, and for 20 s afterwards anything that sounds like the reply is dropped. */
-const recentReplies = [];
-function isEcho(text) {
-  const words = norm(text).split(' ').filter(w => w.length > 2);
-  if (!words.length) return false;
-  const now = Date.now();
-  return recentReplies.some(r => r.until > now && words.filter(w => r.words.has(w)).length / words.length >= 0.6);
-}
-
-// German audio from Google's voice: starts in about 0.2 s and plays like normal audio
-// (the iPhone's own voice can lag several seconds while the microphone is on).
-const replyAudio = new Audio();
-replyAudio.preload = 'auto';
-const SILENT_WAV = URL.createObjectURL(toWav([new Float32Array(1600)], 16000));
-function unlockReplyAudio() { try { replyAudio.src = SILENT_WAV; replyAudio.play().catch(() => {}); } catch {} }
-function ttsChunks(text) {      // the voice takes up to ~200 characters at a time
-  const parts = text.match(/[^.!?;,]+[.!?;,]*\s*/g) || [text], out = [];
-  for (const p of parts) {
-    if (out.length && (out[out.length - 1] + p).length <= 190) out[out.length - 1] += p; else out.push(p.slice(0, 190));
-  }
-  return out.map(s => s.trim()).filter(Boolean);
-}
-const ttsUrl = (s, lang) => `https://translate.googleapis.com/translate_tts?client=gtx&ie=UTF-8&tl=${lang}&q=${encodeURIComponent(s)}`;
-
-let replyRun = 0;
 function sayGerman(de) {
-  const run = ++replyRun, btn = $('playReply');
-  // Pause listening and the English voice right away.
+  if (!synth) { banner('This browser cannot speak German aloud.', 'Read the green German text out loud instead.'); return; }
+  // Pause the English voice and stop listening, so your reply isn't translated back.
   replyPlaying = true; muteInputUntil = Infinity;
-  const echo = { words: new Set(norm(de).split(' ').filter(w => w.length > 2)), until: Infinity };
-  recentReplies.push(echo); if (recentReplies.length > 5) recentReplies.shift();
-  speakQueue.length = 0; speakingNow = null;
-  try { synth?.cancel(); } catch {}
-  try { groqSource?.stop(); } catch {}
+  speakingNow = null;
+  try { synth.cancel(); } catch {}
   try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch {}
-  if (running) setStatus('wait', 'Paused — playing your reply');
-  btn.textContent = '🔊 Playing…';
-
-  let ended = false;
-  const end = () => {
-    if (ended || run !== replyRun) return; ended = true;
-    echo.until = Date.now() + 20000;
-    replyPlaying = false; muteInputUntil = Date.now() + 800;
-    btn.textContent = '🔊 Play in German';
-    if (session) { liveEl?.remove(); liveEl = null; liveText = ''; dropSession(); }   // fresh start for built-in speech
-    setTimeout(() => { if (running && !replyPlaying && dot.className !== 'err') setStatus('live', 'Listening…'); }, 800);
-    pump();
-  };
-  setTimeout(end, 45000);   // safety: never stay paused
-
-  const chunks = ttsChunks(de);
-  let i = 0;
-  const next = () => {
-    if (run !== replyRun || ended) return;
-    if (i >= chunks.length) return end();
-    replyAudio.onended = next;
-    replyAudio.onerror = () => { if (run === replyRun) phoneGerman(chunks.slice(i).join(' '), end); };
-    replyAudio.src = ttsUrl(chunks[i++], 'de');
-    replyAudio.play().catch(() => { if (run === replyRun) phoneGerman(chunks.slice(i - 1).join(' '), end); });
-  };
-  next();
-}
-
-// Fallback: the phone's own German voice.
-function phoneGerman(de, end) {
-  replyAudio.onended = replyAudio.onerror = null;
-  if (!synth) { end(); banner('Could not play the German voice.', 'Read the green German text out loud instead.'); return; }
   const u = new SpeechSynthesisUtterance(de);
   u.lang = deVoice?.lang || 'de-DE';
   if (deVoice) u.voice = deVoice;
   u.rate = 0.9;
+  let started = false, ended = false;
+  const btn = $('playReply');
+  u.onstart = () => { started = true; btn.textContent = '🔊 Playing…'; };
+  const end = () => {
+    if (ended) return; ended = true;
+    replyPlaying = false; muteInputUntil = Date.now() + 700;
+    btn.textContent = '🔊 Play in German';
+    pump();
+  };
   u.onend = end; u.onerror = end;
   synth.speak(u);
+  setTimeout(() => {
+    if (started || ended) return;
+    end();
+    banner('Your phone did not play the German voice.', 'Turn the silent switch off and try again — or read the green German text out loud.');
+  }, 3000);
+  setTimeout(end, 30000);   // safety: never stay muted
 }
 
 // Keep the reply box above the iPhone keyboard.
